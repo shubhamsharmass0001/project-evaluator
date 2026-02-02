@@ -7,3 +7,5 @@ lxml
 streamlit
 watchdog
 python-levenshtein
+xlsxwriter
+altair<5
