@@ -1,11 +1,12 @@
+streamlit==1.32.2
 pandas
+numpy
 openpyxl
+xlsxwriter
 requests
 beautifulsoup4
-thefuzz
 lxml
-streamlit
-watchdog
-python-levenshtein
-xlsxwriter
+thefuzz
+python-Levenshtein
+scikit-learn
 altair<5
