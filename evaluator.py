@@ -24,7 +24,6 @@ def validate_coursera(url, student_name):
     """
     result = {
         'Coursera Valid': False,
-        'Coursera Extracted Name': None,
         'Coursera Date': None,
         'Coursera Match Score': 0,
         'Coursera Notes': ''
@@ -142,8 +141,50 @@ def validate_coursera(url, student_name):
         
         result['Coursera Date'] = extracted_date
         
+        # 3. Extract Course Name
+        extracted_course = None
+        
+        # Strategy A: Cleanest Source -> og:title / twitter:title
+        # Value: "Completion Certificate for Working with BigQuery"
+        for meta_name in ['og:title', 'twitter:title']:
+            meta = soup.find('meta', attrs={'name': meta_name}) or soup.find('meta', attrs={'property': meta_name})
+            if meta and meta.get('content'):
+                title_val = meta['content'].strip()
+                if "Completion Certificate for" in title_val:
+                    extracted_course = title_val.replace("Completion Certificate for", "").strip()
+                    break
+        
+        # Strategy B: OpenGraph Description with regex
+        # Value: 'This certificate verifies my successful completion of Coursera\'s "Working with BigQuery" on Coursera'
+        if not extracted_course:
+            for meta_name in ['og:description', 'twitter:description', 'description']:
+                meta = soup.find('meta', attrs={'name': meta_name}) or soup.find('meta', attrs={'property': meta_name})
+                if meta and meta.get('content'):
+                    desc = meta['content']
+                    # Regex to capture text inside quotes or after "Coursera's"
+                    # Try simple "completion of [Coursera's] "COURSE" on Coursera"
+                    match = re.search(r"completion of\s+(?:Coursera's\s+)?[\"']?(.+?)[\"']?\s+on\s+Coursera", desc, re.IGNORECASE)
+                    if match:
+                        extracted_course = match.group(1).strip()
+                        break
+
+        # Strategy C: First H2 tag (often the course name)
+        # In debug: <h2>Working with BigQuery</h2> appears first.
+        if not extracted_course:
+             h2s = soup.find_all('h2')
+             if h2s:
+                 first_h2 = h2s[0].get_text(strip=True)
+                 # Filter out generic H2s just in case
+                 generics = ['What you will learn', 'Skills you will gain', 'Certificates', 'About']
+                 if len(first_h2) > 3 and not any(g.lower() in first_h2.lower() for g in generics):
+                     extracted_course = first_h2
+
+        result['Coursera Course Name'] = extracted_course
+        
         # Remove the verbose extracted name logic entirely as requested
 
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        raise e
     except Exception as e:
         result['Coursera Notes'] = f'Error: {str(e)}'
 
@@ -271,6 +312,8 @@ def validate_linkedin(url, student_name):
         result['LinkedIn Valid'] = True 
         result['LinkedIn Notes'] += 'Link reachable. '
 
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+        raise e
     except Exception as e:
         result['LinkedIn Notes'] = f'Error: {str(e)}'
 

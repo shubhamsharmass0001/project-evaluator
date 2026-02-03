@@ -2,8 +2,112 @@ import streamlit as st
 import pandas as pd
 import time
 import concurrent.futures
+import json
+import os
+import pickle
+import hashlib
+import requests
+
+# --- Helper Functions for History ---
+HISTORY_FILE = "email_history.json"
+
+def load_email_history():
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return []
+    return []
+
+def save_email_history(email):
+    if not email: return
+    history = load_email_history()
+    # Remove if exists to move to top
+    if email in history:
+        history.remove(email)
+    history.insert(0, email) # Prepend
+    # Keep top 10
+    history = history[:10]
+    with open(HISTORY_FILE, "w") as f:
+        json.dump(history, f)
+
+# --- Persistence Helpers ---
+PROGRESS_FILE = "progress_cache.pkl"
+META_FILE = "progress_meta.json"
+
+def compute_file_hash(file_bytes):
+    """Compute MD5 hash of file content to identify unique datasets."""
+    return hashlib.md5(file_bytes).hexdigest()
+
+def save_progress(file_hash, results_map):
+    """Save current progress to a pickle file and metadata to JSON."""
+    try:
+        data = {
+            "file_hash": file_hash,
+            "results_map": results_map
+        }
+        with open(PROGRESS_FILE, "wb") as f:
+            pickle.dump(data, f)
+            
+        # Save lightweight metadata
+        meta = {"file_hash": file_hash, "count": len(results_map)}
+        with open(META_FILE, "w") as f:
+            json.dump(meta, f)
+            
+    except Exception as e:
+        print(f"Error saving progress: {e}")
+
+def load_progress(current_file_hash):
+    """
+    Load progress if cache exists and matches current file.
+    Checks metadata first to avoid loading large pickle if mismatch.
+    Returns: (results_map, is_resumed) or ({}, False)
+    """
+    # 1. Check Metadata first (Fast)
+    if os.path.exists(META_FILE):
+        try:
+            with open(META_FILE, "r") as f:
+                meta = json.load(f)
+            if meta.get("file_hash") != current_file_hash:
+                return {}, False
+        except:
+             pass # If meta fails, fall back to main file check or just fail
+    else:
+        if not os.path.exists(PROGRESS_FILE):
+             return {}, False
+
+    # 2. Load Pickle (Slow)
+    try:
+        if not os.path.exists(PROGRESS_FILE):
+             return {}, False
+             
+        with open(PROGRESS_FILE, "rb") as f:
+            data = pickle.load(f)
+        
+        if data.get("file_hash") == current_file_hash:
+            return data.get("results_map", {}), True
+        else:
+            return {}, False 
+    except Exception:
+        return {}, False
+
+def clear_progress():
+    """Delete the progress cache files."""
+    for f_path in [PROGRESS_FILE, META_FILE]:
+        if os.path.exists(f_path):
+            try:
+                os.remove(f_path)
+            except:
+                pass
 from io import BytesIO
 from evaluator import process_single_row
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import os
 
 # Page Config
 st.set_page_config(
@@ -26,6 +130,14 @@ st.markdown("""
     .stProgress > div > div > div > div {
         background-color: #00FF00;
     }
+    .success-email {
+        padding: 20px;
+        border-radius: 10px;
+        background-color: #dbf2d9;
+        color: #2e7d32;
+        border: 1px solid #c8e6c9;
+        margin-top: 20px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -36,20 +148,132 @@ st.markdown("Upload your student submissions to validate Coursera certificates a
 # --- Sidebar Configuration ---
 with st.sidebar:
     st.header("⚙️ Configuration")
-    max_workers = st.slider("Parallel Threads", min_value=1, max_value=20, value=5, help="Higher = Faster, but risk of rate limits.")
-    anti_scraping = st.checkbox("Anti-Scraping Mode", value=True, help="Adds delays to avoid LinkedIn 429 errors.")
-    st.info("ℹ️ **Anti-Scraping Mode** is recommended for LinkedIn validation.")
+    max_workers = st.slider("Parallel Threads", min_value=1, max_value=100, value=50, help="Higher = Faster, but risk of rate limits.")
+    
+    # Thread Guidelines
+    st.markdown("""
+    | Threads | Result |
+    | :--- | :--- |
+    | **1–10** | 🐢 Too slow |
+    | **20–40** | ⚖️ Stable + fast |
+    | **50–70** | 🚀 Optimal |
+    | **80–100** | ⚠️ Risky But Works |
+    """)
+
+    # anti_scraping = st.checkbox("Anti-Scraping Mode", value=True, help="Adds delays to avoid LinkedIn 429 errors.")
+    # st.info("ℹ️ **Anti-Scraping Mode** is recommended for LinkedIn validation.")
+    anti_scraping = True # Always active by default per user request
+    
+    st.markdown("---")
+    with st.expander("📧 Email Settings"):
+        smtp_server = st.text_input("SMTP Server", value="smtp.gmail.com")
+        smtp_port = st.number_input("SMTP Port", value=587)
+        sender_email = st.text_input("Sender Email", value="evaluator2209@gmail.com").strip()
+        sender_password = st.text_input("App Password", value="ymub obhg fqew lskc", type="password", help="Use an App Password for Gmail, not your login password.").strip()
+
+# --- Helper Function: Send Email ---
+def send_email_with_attachment(sender, password, recipient, subject, body, attachment_paths, server, port):
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = sender
+        msg['To'] = recipient
+        msg['Subject'] = subject
+        
+        msg.attach(MIMEText(body, 'html'))
+        
+        # Handle single path string for backward compatibility
+        if isinstance(attachment_paths, str):
+            attachment_paths = [attachment_paths]
+            
+        for path in attachment_paths:
+            if os.path.exists(path):
+                with open(path, "rb") as attachment:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(attachment.read())
+                
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    f"attachment; filename= {os.path.basename(path)}",
+                )
+                msg.attach(part)
+        
+        with smtplib.SMTP(server, port) as s:
+            s.starttls()
+            s.login(sender, password)
+            s.send_message(msg)
+        return True, "Email sent successfully!"
+    except Exception as e:
+        return False, str(e)
 
 # --- File Uploader ---
+with st.expander("ℹ️ View Sample Input Format"):
+    st.markdown("Your input file should look something like this:")
+    sample_data = pd.DataFrame({
+        'Student Name': ['John Doe', 'Jane Smith'],
+        'Coursera Link': ['https://coursera.org/verify/XYZ123', 'https://coursera.org/verify/ABC456'],
+        'LinkedIn Link': ['https://linkedin.com/posts/johndoe_certificate', 'https://linkedin.com/in/janesmith']
+    })
+    st.table(sample_data)
+    
+    # Download Sample Button
+    sample_csv = sample_data.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        "📥 Download Sample CSV",
+        sample_csv,
+        "sample_input.csv",
+        "text/csv",
+        key='download-sample'
+    )
+
 uploaded_file = st.file_uploader("Upload Input File (Excel/CSV)", type=['xlsx', 'xls', 'csv'])
 
-if uploaded_file:
-    try:
-        # Load Data
-        if uploaded_file.name.endswith('.csv'):
-            df = pd.read_csv(uploaded_file)
+# Email History UI
+history = load_email_history()
+selected_hist = st.selectbox("🕒 Recent Emails", ["(Select to auto-fill)"] + history)
+
+default_val = ""
+if selected_hist != "(Select to auto-fill)":
+    default_val = selected_hist
+
+recipient_email = st.text_input("📩 Enter Recipient Email for Results", value=default_val, placeholder="e.g., recipient@example.com")
+
+if uploaded_file and recipient_email:
+    # Reset session state if file changes
+    # Use getvalue() to compute hash, then reset pointer for pandas
+    file_bytes = uploaded_file.getvalue()
+    file_hash = compute_file_hash(file_bytes)
+    uploaded_file.seek(0)
+
+    if 'current_file_hash' not in st.session_state or st.session_state['current_file_hash'] != file_hash:
+        st.session_state['current_file_hash'] = file_hash
+        
+        # Try to load existing progress
+        saved_results, is_resumed = load_progress(file_hash)
+        
+        if is_resumed:
+           st.session_state['results_map'] = saved_results
+           st.toast(f"🔄 Resumed progress! {len(saved_results)} records loaded from cache.", icon="📂")
         else:
-            df = pd.read_excel(uploaded_file)
+           st.session_state['results_map'] = {}
+           # If new file, ensure we don't have old cache lying around that might confuse logic later (though hash check prevents it)
+           clear_progress()
+           
+        if 'df_fixed' in st.session_state:
+            del st.session_state['df_fixed']
+
+    try:
+        # Load Data with Caching
+        @st.cache_data
+        def load_data(file_content, filename):
+            if filename.endswith('.csv'):
+                return pd.read_csv(BytesIO(file_content))
+            else:
+                return pd.read_excel(BytesIO(file_content))
+        
+        # Pass bytes to avoid stream position issues with caching
+        uploaded_file.seek(0)
+        df = load_data(uploaded_file.getvalue(), uploaded_file.name)
         
         from thefuzz import fuzz
 
@@ -143,7 +367,31 @@ if uploaded_file:
              st.stop() # Stop here if still missing
              
         else:
-            if st.button("🚀 Start Evaluation", type="primary"):
+            # --- State Management for Dynamic Parallelism ---
+            # We use a persistent dictionary to store results: {row_index: result_dict}
+            if 'results_map' not in st.session_state:
+                st.session_state['results_map'] = {}
+            
+            if 'processing_active' not in st.session_state:
+                st.session_state['processing_active'] = False
+                
+            # Toggle Button Logic
+            if st.session_state.get('processing_active'):
+                if st.button("⏸ Pause Evaluation", type="secondary"):
+                    st.session_state['processing_active'] = False
+                    st.rerun()
+            else:
+                has_data = len(st.session_state.get('results_map', {})) > 0
+                btn_label = "🚀 Resume Evaluation" if has_data else "🚀 Start Evaluation"
+                
+                if st.button(btn_label, type="primary"):
+                    st.session_state['processing_active'] = True
+                    if not has_data:
+                        st.session_state['results_map'] = {} # Reset only if fresh
+                    st.rerun()
+
+            # --- Main Processing Loop ---
+            if st.session_state['processing_active']:
                 
                 # Progress Containers
                 progress_bar = st.progress(0)
@@ -155,88 +403,471 @@ if uploaded_file:
                 m2 = col2.empty()
                 m3 = col3.empty()
                 
-                # Processing Logic
-                results = []
-                total = len(df)
-                
-                # Convert to list of dicts for processing
+                # Prepare Data
                 rows = df.to_dict('records')
+                total = len(rows)
                 
-                # Execute
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    full_futures = {executor.submit(process_single_row, row): row for row in rows}
+                # Identify and Process in Micro-Batches to allow interruption
+                while st.session_state['processing_active']:
+                    # Re-calculate pending every iteration to check if we are done
+                    pending_indices = [i for i in range(total) if i not in st.session_state['results_map']]
                     
-                    completed = 0
-                    valid_coursera = 0
-                    valid_linkedin = 0
-                    
-                    for future in concurrent.futures.as_completed(full_futures):
-                        res = future.result()
-                        results.append(res)
-                        completed += 1
+                    if not pending_indices:
+                        break
                         
-                        # Update Metrics
-                        if res.get('Coursera Valid'): valid_coursera += 1
-                        if res.get('LinkedIn Valid'): valid_linkedin += 1
-                        
-                        # Update UI (throttle updates slightly for performance)
-                        if completed % 2 == 0 or completed == total:
-                            pct = completed / total
-                            progress_bar.progress(pct)
-                            status_text.text(f"Processing... {completed}/{total}")
-                            
-                            m1.metric("Processed", f"{completed}/{total}")
-                            m2.metric("Coursera Valid", f"{valid_coursera}")
-                            m3.metric("LinkedIn Valid", f"{valid_linkedin}")
-                            
-                        # Anti-Scraping Delay (simulated here if needed, but evaluator handles it mostly)
-                        if anti_scraping:
-                            time.sleep(0.1) 
-
-                # Completion
-                st.balloons()
-                status_text.success("✅ Processing Complete!")
-                
-                # Result DataFrame
-                result_df = pd.DataFrame(results)
-                
-                # --- Auto-Save to Disk (for User convenience) ---
-                try:
-                    result_df.to_excel("final_results.xlsx", index=False)
-                    if hasattr(st, 'toast'):
-                        st.toast("Saved final_results.xlsx to project folder!", icon="💾")
-                    else:
-                        st.success("💾 Saved final_results.xlsx to project folder!")
-                except Exception as e:
-                    st.warning(f"Could not save local file: {e}")
-                
-                # Download Button
-                buffer = BytesIO()
-                # Default to xlsxwriter, fallback to openpyxl if needed
-                engine = 'xlsxwriter'
-                try:
-                    import xlsxwriter
-                except ImportError:
-                    engine = 'openpyxl'
-
-                with pd.ExcelWriter(buffer, engine=engine) as writer:
-                    result_df.to_excel(writer, index=False, sheet_name='Results')
+                    # MICRO-BATCHING: Process a small chunk at a time.
+                    # Batch size 1:1 with workers minimizes 'drain time' on interrupt
+                    batch_size = max(max_workers, 10) 
+                    current_batch_indices = pending_indices[:batch_size]
                     
-                st.download_button(
-                    label="📥 Download Final Results",
-                    data=buffer.getvalue(),
-                    file_name="final_results.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                
-                with st.expander("🔍 View Results"):
-                    st.dataframe(result_df)
+                    batch_map = {i: rows[i] for i in current_batch_indices}
+                    
+                    status_text.text(f"Processing Batch... {total - len(pending_indices)}/{total} completed. (Threads: {max_workers})")
+                    
+                    # Run BATCH using current max_workers
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_to_idx = {executor.submit(process_single_row, row): idx for idx, row in batch_map.items()}
+                        
+                        for future in concurrent.futures.as_completed(future_to_idx):
+                            original_idx = future_to_idx[future]
+                            try:
+                                res = future.result()
+                                st.session_state['results_map'][original_idx] = res
+                            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                                st.error(f"🚨 Network Connection Lost! Processing paused. ({e})")
+                                st.warning("Please check your internet connection and click 'Resume Evaluation' when back online.")
+                                st.session_state['processing_active'] = False
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                break
+                            except Exception as e:
+                                err_res = rows[original_idx].copy()
+                                err_res['Overall Status'] = f"Error: {e}"
+                                st.session_state['results_map'][original_idx] = err_res
+                                
+                            # Update UI
+                            curr_total = len(st.session_state['results_map'])
+                            
+                            # Incremental Save (Every 5 rows)
+                            if curr_total % 5 == 0:
+                                save_progress(st.session_state.get('current_file_hash'), st.session_state['results_map'])
+                                
+                            progress_bar.progress(curr_total / total)
+                            status_text.text(f"Processing... {curr_total}/{total} (Threads: {max_workers})")
+                            
+                            # Metrics
+                            all_res = st.session_state['results_map'].values()
+                            v_coursera = sum(1 for r in all_res if r.get('Coursera Valid'))
+                            v_linkedin = sum(1 for r in all_res if r.get('LinkedIn Valid'))
+                            
+                            m1.metric("Processed", f"{curr_total}/{total}")
+                            m2.metric("Coursera Valid", f"{v_coursera}")
+                            m3.metric("LinkedIn Valid", f"{v_linkedin}")
+                            
+                            if anti_scraping:
+                                time.sleep(0.05)
+                    
+                    # If we broke out of inner loop due to error (processing_active set to False)
+                    if not st.session_state['processing_active']:
+                        break
+
+                # --- Completion Check ---
+                # Check again if done
+                if len(st.session_state['results_map']) == total:
+                    st.balloons()
+                    status_text.success("✅ Processing Complete!")
+                    st.session_state['processing_active'] = False # Stop the loop
+                    clear_progress()
+                    
+                    # Final Assembly
+                    final_results = [st.session_state['results_map'][i] for i in range(total)]
+                    
+                    # Result DataFrame
+                    result_df = pd.DataFrame(final_results)
+                    
+                    # Remove 'Coursera Match Score' column if it exists
+                    if 'Coursera Match Score' in result_df.columns:
+                        result_df = result_df.drop(columns=['Coursera Match Score'])
+                        
+                    final_filename = "final_results.xlsx"
+                    summary_filename = "student_summary.xlsx"
+                    
+                    # --- Generate Student Summary ---
+                    summary_df = pd.DataFrame()
+                    try:
+                        # Group fields - try to find unique identifiers
+                        group_cols = ['Student Name']
+                        # Check if Roll Number-like columns exist to be more specific
+                        roll_col = next((c for c in result_df.columns if 'roll' in c.lower() or 'number' in c.lower()), None)
+                        if roll_col:
+                            group_cols.append(roll_col)
+                        
+                        # Aggregation
+                        summary_df = result_df.groupby(group_cols).agg(
+                            Total_Coursera_Links=('Coursera Link', 'count'),
+                            Valid_Coursera_Links=('Coursera Valid', lambda x: x.sum()),
+                            Total_LinkedIn_Links=('LinkedIn Link', 'count'),
+                            Valid_LinkedIn_Links=('LinkedIn Valid', lambda x: x.sum())
+                        ).reset_index()
+                        
+                        # Optional: Add Email if available (take first)
+                        email_col = next((c for c in result_df.columns if 'email' in c.lower()), None)
+                        if email_col:
+                            email_map = result_df.groupby(group_cols)[email_col].first().reset_index()
+                            summary_df = pd.merge(summary_df, email_map, on=group_cols, how='left')
+
+                            # --- Date Variance & Pattern Analysis ---
+                        # Logic: Use 'Timestamp' if available for precise behavior tracking (Bulk vs Weekly).
+                        # Fallback: Use extracted 'Coursera Date' / 'LinkedIn Date' if Timestamp missing.
+                        
+                        date_stats = []
+                        from datetime import datetime, timedelta
+                        
+                        # Reference: Monday Jan 5, 2026 at 08:00 AM
+                        start_date_ref = datetime(2026, 1, 5, 8, 0, 0)
+                        
+                        for name, group in result_df.groupby('Student Name'):
+                            
+                            # --- Unified Date Extraction Logic ---
+                            # Iterate through each row to verify validity and extract the best available date.
+                            # Priority: Timestamp > Extracted Date
+                            
+                            valid_dt_objs = [] 
+                            
+                            # Pre-convert columns to datetime objects for efficiency/robustness if they exist
+                            # We use dayfirst=True for dates like DD-MM-YYYY
+                            
+                            # Helper to get date from row safely
+                            def get_valid_date(val, is_timestamp=False):
+                                try:
+                                    if pd.isna(val) or val == '': return None
+                                    # If it's already a datetime/timestamp object
+                                    if isinstance(val, (pd.Timestamp, datetime)):
+                                        return val
+                                    # Parse string
+                                    dt = pd.to_datetime(val, dayfirst=True, errors='coerce')
+                                    if pd.isna(dt): return None
+                                    return dt
+                                except:
+                                    return None
+
+                            for idx, row in group.iterrows():
+                                # STRICTLY use Extracted Dates (Column L / P logic)
+                                # Ignored Timestamp for summary binning as per user request.
+
+                                # 1. Process Coursera
+                                if row.get('Coursera Valid'):
+                                    c_date_val = row.get('Coursera Date')
+                                    final_dt = get_valid_date(c_date_val)
+                                    # Normalize extracted dates to noon (12:00 PM)
+                                    if final_dt:
+                                        final_dt = final_dt.replace(hour=12, minute=0, second=0)
+                                        valid_dt_objs.append((final_dt, 'Coursera'))
+
+                                # 2. Process LinkedIn
+                                if row.get('LinkedIn Valid'):
+                                    l_date_val = row.get('LinkedIn Date')
+                                    final_dt = get_valid_date(l_date_val)
+                                    # Normalize extracted dates to noon (12:00 PM)
+                                    if final_dt:
+                                        final_dt = final_dt.replace(hour=12, minute=0, second=0)
+                                        valid_dt_objs.append((final_dt, 'LinkedIn'))
+                            
+                            # --- Scoring & Analysis ---
+                            student_stat = {
+                                'Student Name': name,
+                                'Days Span': 0,
+                                'Consistency Status': 'No Dates Found',
+                                'Till Now Marks': 0
+                            }
+                            
+                            # Filter only dates within first 12 weeks AND Calculate Scores
+                            filtered_dts_only = []
+                            week_counts_c = {}
+                            week_counts_l = {}
+                            week_headers = {} # Map eff_week_num -> col_name
+                            
+                            for dt, subtype in valid_dt_objs:
+                                diff = dt - start_date_ref
+                                if diff.total_seconds() < 0:
+                                    raw_week_num = 1
+                                else:
+                                    raw_week_num = (diff.days // 7) + 1
+                                
+                                # ONLY allow up to Week 12
+                                if 1 <= raw_week_num <= 12:
+                                    filtered_dts_only.append(dt)
+                                    
+                                    # --- Merge Week 1 & 2 Logic ---
+                                    if raw_week_num in [1, 2]:
+                                        eff_week_num = 1.5
+                                        # Special Header for W1+2
+                                        range_str = "05 Jan - 19 Jan"
+                                        col_name = "Week 1 & 2 (05 Jan - 19 Jan)"
+                                    else:
+                                        eff_week_num = raw_week_num
+                                        # Normal Header (Mon-Mon)
+                                        w_start = start_date_ref + timedelta(days=(raw_week_num - 1) * 7)
+                                        w_end = w_start + timedelta(days=7) 
+                                        range_str = f"{w_start.strftime('%d %b')} - {w_end.strftime('%d %b')}"
+                                        col_name = f"Week {raw_week_num} ({range_str})"
+                                    
+                                    # Store Link
+                                    week_headers[eff_week_num] = col_name
+
+                                    if subtype == 'Coursera':
+                                        week_counts_c[eff_week_num] = week_counts_c.get(eff_week_num, 0) + 1
+                                    elif subtype == 'LinkedIn':
+                                        week_counts_l[eff_week_num] = week_counts_l.get(eff_week_num, 0) + 1
+                            
+                            # --- Calculate "Till Now Marks" ---
+                            current_now = datetime.now()
+                            curr_diff = current_now - start_date_ref
+                            if curr_diff.total_seconds() < 0:
+                                max_raw_week = 1
+                            else:
+                                max_raw_week = (curr_diff.days // 7) + 1
+
+                            max_raw_week = min(max_raw_week, 12) # Cap at 12
+                            if max_raw_week < 1: max_raw_week = 1
+                            
+                            # Determine effective weeks to evaluate
+                            weeks_to_eval = []
+                            # If we are in or past week 1, we evaluate the "Week 1 & 2" block
+                            # Since we merged them, we always check bucket 1.5 if max_raw_week >= 1
+                            if max_raw_week >= 1:
+                                weeks_to_eval.append(1.5)
+                            
+                            # Then add subsequent weeks if passed
+                            for w in range(3, max_raw_week + 1):
+                                weeks_to_eval.append(w)
+                            
+                            total_c_points = 0
+                            total_l_points = 0
+                            total_weeks_weight = 0
+                            
+                            for w in weeks_to_eval:
+                                c_count = week_counts_c.get(w, 0)
+                                l_count = week_counts_l.get(w, 0)
+                                
+                                if w == 1.5:
+                                    # Merged Block: Target 4, Weight 2
+                                    weight = 2.0
+                                    target = 4.0
+                                else:
+                                    # Normal Week: Target 2, Weight 1
+                                    weight = 1.0
+                                    target = 2.0
+                                
+                                total_c_points += (min(c_count, target) / target) * weight
+                                total_l_points += (min(l_count, target) / target) * weight
+                                total_weeks_weight += weight
+                            
+                            # Normalize
+                            if total_weeks_weight > 0:
+                                final_c_score = (total_c_points / total_weeks_weight) * 4
+                                final_l_score = (total_l_points / total_weeks_weight) * 4
+                            else:
+                                final_c_score = 0
+                                final_l_score = 0
+                            
+                            final_marks = round(final_c_score + final_l_score, 2)
+
+                            # --- Stats ---
+                            if filtered_dts_only:
+                                min_date = min(filtered_dts_only)
+                                max_date = max(filtered_dts_only)
+                                span_days = (max_date - min_date).days
+                            else:
+                                span_days = 0
+
+                            # Consistency Status
+                            total_links_filtered = len(filtered_dts_only)
+                            status = "Incomplete Data"
+                            if total_links_filtered >= 4:
+                                if span_days <= 2:
+                                    status = "⚠️ Bulk Submission (< 2 Days)"
+                                elif span_days > 7: 
+                                    status = "✅ Weekly Spread"
+                                else:
+                                    status = "⚖️ Moderate Pace"
+                            elif total_links_filtered > 0:
+                                 status = "Incomplete Data"
+                            else:
+                                 status = "No Valid Dates (in 12 weeks)"
+
+                            student_stat.update({
+                                'Days Span': span_days,
+                                'Consistency Status': status,
+                                'Till Now Marks': final_marks
+                            })
+                            
+                            # Add week columns with formatted strings
+                            for w, c_name in week_headers.items():
+                                c = week_counts_c.get(w, 0)
+                                l = week_counts_l.get(w, 0)
+                                tot = c + l
+                                fmt_val = f"{tot} = {c} + {l}"
+                                student_stat[c_name] = fmt_val
+                            
+                            date_stats.append(student_stat)
+                        
+                        # Merge Date Stats
+                        date_stats_df = pd.DataFrame(date_stats)
+                        
+                        # Fill NaN week counts with "0 = 0 + 0"
+                        week_cols = [c for c in date_stats_df.columns if c.startswith('Week ')]
+                        date_stats_df[week_cols] = date_stats_df[week_cols].fillna("0 = 0 + 0")
+                        
+                        # Sort columns properly
+                        def sort_week_key(col_name):
+                            try:
+                                # Handle "Week 1 & 2"
+                                if "Week 1 & 2" in col_name:
+                                    return 1
+                                num_part = col_name.split('Week ')[1].split(' (')[0]
+                                return int(num_part)
+                            except:
+                                return 999
+                        
+                        sorted_week_cols = sorted(week_cols, key=sort_week_key)
+                        
+                        # Reorder date_stats_df
+                        base_cols = [c for c in date_stats_df.columns if c not in week_cols]
+                        date_stats_df = date_stats_df[base_cols + sorted_week_cols]
+                        
+                        summary_df = pd.merge(summary_df, date_stats_df, on='Student Name', how='left')
+
+                    except Exception as e:
+                        st.warning(f"Could not generate summary sheet: {e}")
+
+                    # --- Auto-Save Independent Files ---
+                    try:
+                        # 1. Main Detailed Results
+                        with pd.ExcelWriter(final_filename, engine='xlsxwriter') as writer:
+                            result_df.to_excel(writer, index=False, sheet_name='Detailed Results')
+                            # Auto-adjust columns
+                            worksheet = writer.sheets['Detailed Results']
+                            for i, col in enumerate(result_df.columns):
+                                max_len = max(
+                                    result_df[col].astype(str).map(len).max(),
+                                    len(col)
+                                ) + 2
+                                worksheet.set_column(i, i, min(max_len, 50)) # Cap at 50 width
+                        
+                        # 2. Student Summary
+                        if not summary_df.empty:
+                            with pd.ExcelWriter(summary_filename, engine='xlsxwriter') as writer:
+                                summary_df.to_excel(writer, index=False, sheet_name='Student Summary')
+                                # Auto-adjust columns for Summary
+                                worksheet = writer.sheets['Student Summary']
+                                for i, col in enumerate(summary_df.columns):
+                                    max_len = max(
+                                        summary_df[col].astype(str).map(len).max(),
+                                        len(col)
+                                    ) + 2
+                                    worksheet.set_column(i, i, min(max_len, 40))
+                                
+                        if hasattr(st, 'toast'):
+                            st.toast(f"Saved results to project folder!", icon="💾")
+                        else:
+                            st.success(f"💾 Saved results to project folder!")
+                    except Exception as e:
+                        st.warning(f"Could not save local files: {e}")
+                    
+                    # --- Email Delivery (Multi-Attachment) ---
+                    if sender_email and sender_password and recipient_email:
+                        with st.spinner("📧 Sending result email..."):
+                            email_subject = "Evaluation Completed – Your Result Files"
+                            email_body = """
+                            <p>Hello,</p>
+                            <p>Congratulations! 🎉 You have successfully completed your task.</p>
+                            <p>Please find attached:</p>
+                            <ul>
+                                <li><b>final_results.xlsx</b>: Detailed evaluation data.</li>
+                                <li><b>student_summary.xlsx</b>: Aggregated student performance.</li>
+                            </ul>
+                            <br>
+                            <p><i>Best regards,<br>Automated Project Evaluator</i></p>
+                            """
+                            
+                            attachments = [final_filename]
+                            if not summary_df.empty:
+                                attachments.append(summary_filename)
+                                
+                            success, message = send_email_with_attachment(
+                                sender_email, sender_password, recipient_email, 
+                                email_subject, email_body, attachments, smtp_server, smtp_port
+                            )
+                            
+                            if success:
+                                save_email_history(recipient_email)
+                                st.markdown(f"""
+                                <div class="success-email">
+                                    <h3>🚀 Email Sent Verification</h3>
+                                    <p>The result files have been successfully emailed to <b>{recipient_email}</b>.</p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                            else:
+                                st.error(f"❌ Failed to send email: {message}")
+                    elif not (sender_email and sender_password):
+                        st.warning("⚠️ Email not sent: Please configure Sender Email & App Password in the sidebar.")
+                    
+                    # --- Downloads ---
+                    c_d1, c_d2 = st.columns(2)
+                    
+                    # Download 1: Final Results
+                    buffer = BytesIO()
+                    engine = 'xlsxwriter'
+                    try:
+                        import xlsxwriter
+                    except ImportError:
+                        engine = 'openpyxl'
+                    
+                    with pd.ExcelWriter(buffer, engine=engine) as writer:
+                        result_df.to_excel(writer, index=False, sheet_name='Detailed Results')
+                        # Auto-adjust columns in Download buffer too
+                        if engine == 'xlsxwriter':
+                             worksheet = writer.sheets['Detailed Results']
+                             for i, col in enumerate(result_df.columns):
+                                max_len = max(result_df[col].astype(str).map(len).max(), len(col)) + 2
+                                worksheet.set_column(i, i, min(max_len, 50))
+                        
+                    c_d1.download_button(
+                        label="📥 Download Detailed Results",
+                        data=buffer.getvalue(),
+                        file_name="final_results.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                    
+                    # Download 2: Summary
+                    if not summary_df.empty:
+                        buffer_sum = BytesIO()
+                        with pd.ExcelWriter(buffer_sum, engine=engine) as writer:
+                            summary_df.to_excel(writer, index=False, sheet_name='Student Summary')
+                            # Auto-adjust columns in Download buffer too
+                            if engine == 'xlsxwriter':
+                                 worksheet = writer.sheets['Student Summary']
+                                 for i, col in enumerate(summary_df.columns):
+                                     max_len = max(summary_df[col].astype(str).map(len).max(), len(col)) + 2
+                                     worksheet.set_column(i, i, min(max_len, 40))
+                            
+                        c_d2.download_button(
+                            label="📊 Download Student Summary",
+                            data=buffer_sum.getvalue(),
+                            file_name="student_summary.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                    
+                    with st.expander("🔍 View Results"):
+                        st.dataframe(result_df)
 
     except Exception as e:
         st.error(f"Error during processing: {e}")
         # Show partial results if available
         if 'result_df' in locals():
              st.download_button("Download Partial Results", result_df.to_csv().encode('utf-8'), "partial_results.csv")
+elif uploaded_file and not recipient_email:
+    st.info("ℹ️ Please enter an email address to proceed with evaluation and delivery.")
 
 # Footer
 st.markdown("---")
