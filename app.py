@@ -628,9 +628,9 @@ if uploaded_file and recipient_email:
                     if not pending_indices:
                         break
                         
-                    # MICRO-BATCHING: Process a small chunk at a time.
-                    # Batch size 1:1 with workers minimizes 'drain time' on interrupt
-                    batch_size = max(max_workers, 10) 
+                    # MICRO-BATCHING: Process a chunk at a time.
+                    # Increased batch size to 4x workers to reduce "drain" overhead
+                    batch_size = max(max_workers * 4, 20) 
                     current_batch_indices = pending_indices[:batch_size]
                     
                     batch_map = {i: rows[i] for i in current_batch_indices}
@@ -647,11 +647,12 @@ if uploaded_file and recipient_email:
                                 res = future.result()
                                 st.session_state['results_map'][original_idx] = res
                             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                                st.error(f"🚨 Network Connection Lost! Processing paused. ({e})")
-                                st.warning("Please check your internet connection and click 'Resume Evaluation' when back online.")
-                                st.session_state['processing_active'] = False
-                                executor.shutdown(wait=False, cancel_futures=True)
-                                break
+                                # Infinite Retry Strategy:
+                                # We do NOT save to st.session_state['results_map'].
+                                # This keeps the index in 'pending_indices', so the main loop picks it up again in the next batch.
+                                # st.toast(f"🔄 Network glitch on row {original_idx+1}. Retrying...", icon="⏳") # Hiding notification as requested
+                                time.sleep(0.5) # Brief pause before next worker takes it
+
                             except Exception as e:
                                 err_res = rows[original_idx].copy()
                                 err_res['Overall Status'] = f"Error: {e}"
@@ -788,8 +789,6 @@ if uploaded_file and recipient_email:
                             # --- Scoring & Analysis ---
                             student_stat = {
                                 'Student Name': name,
-                                'Days Span': 0,
-                                'Consistency Status': 'No Dates Found',
                                 'Till Now Marks': 0
                             }
                             
@@ -832,89 +831,70 @@ if uploaded_file and recipient_email:
                                     elif subtype == 'LinkedIn':
                                         week_counts_l[eff_week_num] = week_counts_l.get(eff_week_num, 0) + 1
                             
-                            # --- Calculate "Till Now Marks" ---
+                            # --- Calculate "Till Now Marks" (Cumulative) ---
                             current_now = datetime.now()
                             curr_diff = current_now - start_date_ref
+                            
                             if curr_diff.total_seconds() < 0:
-                                max_raw_week = 1
+                                weeks_elapsed = 1
                             else:
-                                max_raw_week = (curr_diff.days // 7) + 1
-
-                            max_raw_week = min(max_raw_week, 12) # Cap at 12
-                            if max_raw_week < 1: max_raw_week = 1
+                                weeks_elapsed = (curr_diff.days // 7) + 1
                             
-                            # Determine effective weeks to evaluate
-                            weeks_to_eval = []
-                            # If we are in or past week 1, we evaluate the "Week 1 & 2" block
-                            # Since we merged them, we always check bucket 1.5 if max_raw_week >= 1
-                            if max_raw_week >= 1:
-                                weeks_to_eval.append(1.5)
+                            # Calculate Cumulative Target
+                            # Week 1+2 = 8 total (implies ~4/week pace, but strict checkpoint at W2=8)
+                            # Week 3 = +4 (Total 12)
+                            # Week 4 = +4 (Total 16) ...
                             
-                            # Then add subsequent weeks if passed
-                            for w in range(3, max_raw_week + 1):
-                                weeks_to_eval.append(w)
+                            if weeks_elapsed <= 1:
+                                target_submissions = 4 # Assumed linear for W1
+                            elif weeks_elapsed == 2:
+                                target_submissions = 8
+                            else:
+                                # For W3+: 8 + (weeks_past_2 * 4)
+                                target_submissions = 8 + ((weeks_elapsed - 2) * 4)
+                                
+                            # Count Total Valid Submissions with WEEKLY CAPPING
+                            # Logic:
+                            # Week 1 & 2: Cap at 8
+                            # Week 3+: Cap at 4 per week
+                            # This prevents "dumping" all submissions in one week.
                             
-                            total_c_points = 0
-                            total_l_points = 0
-                            total_weeks_weight = 0
+                            total_capped_points = 0
                             
-                            for w in weeks_to_eval:
+                            # Identify all unique weeks processed for this student
+                            all_weeks = set(week_counts_c.keys()) | set(week_counts_l.keys())
+                            
+                            for w in all_weeks:
+                                # Skip future weeks (if w > weeks_elapsed)
+                                # Note: w=1.5 covers Week 1 and 2. 
+                                if w != 1.5 and w > weeks_elapsed:
+                                    continue
+                                
                                 c_count = week_counts_c.get(w, 0)
                                 l_count = week_counts_l.get(w, 0)
+                                total_in_week = c_count + l_count
                                 
                                 if w == 1.5:
-                                    # Merged Block: Target 4, Weight 2
-                                    weight = 2.0
-                                    target = 4.0
+                                    # Week 1 & 2 Cap
+                                    capped_val = min(total_in_week, 8)
                                 else:
-                                    # Normal Week: Target 2, Weight 1
-                                    weight = 1.0
-                                    target = 2.0
+                                    # Standard Week Cap
+                                    capped_val = min(total_in_week, 4)
+                                    
+                                total_capped_points += capped_val
+                                    
+                            # Calculate Score (Max 8)
+                            if target_submissions > 0:
+                                score = (total_capped_points / target_submissions) * 8
+                            else:
+                                score = 0
                                 
-                                total_c_points += (min(c_count, target) / target) * weight
-                                total_l_points += (min(l_count, target) / target) * weight
-                                total_weeks_weight += weight
-                            
-                            # Normalize
-                            if total_weeks_weight > 0:
-                                final_c_score = (total_c_points / total_weeks_weight) * 4
-                                final_l_score = (total_l_points / total_weeks_weight) * 4
-                            else:
-                                final_c_score = 0
-                                final_l_score = 0
-                            
-                            final_marks = round(final_c_score + final_l_score, 2)
-
-                            # --- Stats ---
-                            if filtered_dts_only:
-                                min_date = min(filtered_dts_only)
-                                max_date = max(filtered_dts_only)
-                                span_days = (max_date - min_date).days
-                            else:
-                                span_days = 0
-
-                            # Consistency Status
-                            total_links_filtered = len(filtered_dts_only)
-                            status = "Incomplete Data"
-                            if total_links_filtered >= 4:
-                                if span_days <= 2:
-                                    status = "⚠️ Bulk Submission (< 2 Days)"
-                                elif span_days > 7: 
-                                    status = "✅ Weekly Spread"
-                                else:
-                                    status = "⚖️ Moderate Pace"
-                            elif total_links_filtered > 0:
-                                 status = "Incomplete Data"
-                            else:
-                                 status = "No Valid Dates (in 12 weeks)"
-
                             student_stat.update({
-                                'Days Span': span_days,
-                                'Consistency Status': status,
-                                'Till Now Marks': final_marks
+                                'Till Now Marks': min(round(score, 2), 8.0)
                             })
+                            # Removed 'Days Span' and 'Consistency Status' as requested
                             
-                            # Add week columns with formatted strings
+                            # Add week columns with formatted strings for reference only
                             for w, c_name in week_headers.items():
                                 c = week_counts_c.get(w, 0)
                                 l = week_counts_l.get(w, 0)

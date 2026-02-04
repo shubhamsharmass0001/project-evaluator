@@ -39,7 +39,21 @@ def validate_coursera(url, student_name):
         return result
 
     try:
-        response = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        # Retry logic for main request
+        response = None
+        for attempt in range(2): # Reduced to 2 attempts for speed
+            try:
+                response = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True) # Reduced timeout
+                if response.status_code == 200:
+                    break
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                if attempt == 1: raise # Raise on last attempt
+                time.sleep(1.5 * (attempt + 1)) # Backoff: 1.5s
+        
+        if not response:
+             result['Coursera Notes'] = 'Failed to connect after retries'
+             return result
+
         final_url = response.url
         
         # Check if redirected to a generic course page
