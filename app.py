@@ -355,17 +355,11 @@ with st.sidebar:
                 else:
                     st.error(f"❌ Connection Failed: {t_msg}")
 
-    # User Profile at Bottom (simulated)
-    st.markdown("<br>"*5, unsafe_allow_html=True) # Spacer
-    st.markdown("""
-    <div style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #151725; border-radius: 8px;">
-        <div style="width: 35px; height: 35px; background: #6366f1; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; color: white;">SS</div>
-        <div>
-            <div style="font-size: 0.9rem; font-weight: 600;">Shubham Sharma</div>
-            <div style="font-size: 0.7rem; color: #888;">Admin Workspace</div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+    # Support Contact
+    st.markdown("<br>"*2, unsafe_allow_html=True)
+    st.markdown("---")
+    st.caption("📧 Support & Contact")
+    st.markdown("**evaluator2209@gmail.com**")
     
     # Hidden / Default Configs
     anti_scraping = True 
