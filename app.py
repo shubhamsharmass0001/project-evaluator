@@ -698,6 +698,10 @@ if uploaded_file and recipient_email:
                     # Result DataFrame
                     result_df = pd.DataFrame(final_results)
                     
+                    # Clean Student Name to ensure merging (strip whitespace, title case)
+                    if 'Student Name' in result_df.columns:
+                        result_df['Student Name'] = result_df['Student Name'].astype(str).str.strip().str.title()
+                    
                     # Remove 'Coursera Match Score' column if it exists
                     if 'Coursera Match Score' in result_df.columns:
                         result_df = result_df.drop(columns=['Coursera Match Score'])
@@ -708,26 +712,41 @@ if uploaded_file and recipient_email:
                     # --- Generate Student Summary ---
                     summary_df = pd.DataFrame()
                     try:
-                        # Group fields - try to find unique identifiers
-                        group_cols = ['Student Name']
-                        # Check if Roll Number-like columns exist to be more specific
+                        # Identify Columns
                         roll_col = next((c for c in result_df.columns if 'roll' in c.lower() or 'number' in c.lower()), None)
+                        email_col = next((c for c in result_df.columns if 'email' in c.lower()), None)
+                        
+                        # Clean Roll Number column to ensure merging (force string + strip)
+                        # This fixes the issue where "102303929" (int) and "102303929 " (str) didn't merge
                         if roll_col:
-                            group_cols.append(roll_col)
+                             result_df[roll_col] = result_df[roll_col].astype(str).str.strip()
+
+                        
+                        # Aggregation Dictionary Base
+                        agg_dict = {
+                            'Total_Coursera_Links': ('Coursera Link', 'count'),
+                            'Valid_Coursera_Links': ('Coursera Valid', lambda x: x.sum()),
+                            'Total_LinkedIn_Links': ('LinkedIn Link', 'count'),
+                            'Valid_LinkedIn_Links': ('LinkedIn Valid', lambda x: x.sum())
+                        }
+
+                        # Determine Grouping Key
+                        if roll_col:
+                            # User Request: Merge by Roll Number
+                            group_cols = [roll_col]
+                            # Aggregate Name (take first)
+                            agg_dict['Student Name'] = ('Student Name', 'first')
+                        else:
+                            # Fallback: Group by Name
+                            group_cols = ['Student Name']
+
+                        # Aggregate Email if exists
+                        if email_col:
+                            agg_dict[email_col] = (email_col, 'first')
                         
                         # Aggregation
-                        summary_df = result_df.groupby(group_cols).agg(
-                            Total_Coursera_Links=('Coursera Link', 'count'),
-                            Valid_Coursera_Links=('Coursera Valid', lambda x: x.sum()),
-                            Total_LinkedIn_Links=('LinkedIn Link', 'count'),
-                            Valid_LinkedIn_Links=('LinkedIn Valid', lambda x: x.sum())
-                        ).reset_index()
-                        
-                        # Optional: Add Email if available (take first)
-                        email_col = next((c for c in result_df.columns if 'email' in c.lower()), None)
-                        if email_col:
-                            email_map = result_df.groupby(group_cols)[email_col].first().reset_index()
-                            summary_df = pd.merge(summary_df, email_map, on=group_cols, how='left')
+                        summary_df = result_df.groupby(group_cols).agg(**agg_dict).reset_index()
+
 
                             # --- Date Variance & Pattern Analysis ---
                         # Logic: Use 'Timestamp' if available for precise behavior tracking (Bulk vs Weekly).
@@ -739,7 +758,19 @@ if uploaded_file and recipient_email:
                         # Reference: Monday Jan 5, 2026 at 08:00 AM
                         start_date_ref = datetime(2026, 1, 5, 8, 0, 0)
                         
-                        for name, group in result_df.groupby('Student Name'):
+                        # Use the SAME grouping as Summary DF
+                        # group_cols was defined above (e.g. [RollNo] or [StudentName])
+                        
+                        for key_val, group in result_df.groupby(group_cols):
+                            
+                            # Determine Primary Name for display
+                            if roll_col and roll_col in group_cols:
+                                # grouped by roll -> get name
+                                name = group['Student Name'].iloc[0]
+                                # key_val is the roll number
+                            else:
+                                # grouped by name -> key_val is name
+                                name = key_val
                             
                             # --- Unified Date Extraction Logic ---
                             # Iterate through each row to verify validity and extract the best available date.
@@ -792,40 +823,36 @@ if uploaded_file and recipient_email:
                                 'Till Now Marks': 0
                             }
                             
+                            # Add the Group Key to student_stat so we can merge back
+                            if roll_col and roll_col in group_cols:
+                                student_stat[roll_col] = key_val
+                            
                             # Filter only dates within first 12 weeks AND Calculate Scores
                             filtered_dts_only = []
                             week_counts_c = {}
                             week_counts_l = {}
                             week_headers = {} # Map eff_week_num -> col_name
                             
-                            for dt, subtype in valid_dt_objs:
-                                diff = dt - start_date_ref
-                                if diff.total_seconds() < 0:
-                                    raw_week_num = 1
-                                else:
-                                    raw_week_num = (diff.days // 7) + 1
+                            for dt_obj, subtype in valid_dt_objs:
+                                diff = dt_obj - start_date_ref
+                                days_diff = diff.days
+                                # Calculate Week Number (0-based)
+                                week_num = (days_diff // 7) + 1
                                 
-                                # ONLY allow up to Week 12
-                                if 1 <= raw_week_num <= 12:
-                                    filtered_dts_only.append(dt)
+                                # Cap at 12 weeks
+                                if week_num <= 12:
+                                    # Week 1 & 2 Merge Logic
+                                    if week_num <= 0: week_num = 1 # Handle pre-start dates as W1
                                     
-                                    # --- Merge Week 1 & 2 Logic ---
-                                    if raw_week_num in [1, 2]:
-                                        eff_week_num = 1.5
-                                        # Special Header for W1+2
-                                        range_str = "05 Jan - 19 Jan"
-                                        col_name = "Week 1 & 2 (05 Jan - 19 Jan)"
-                                    else:
-                                        eff_week_num = raw_week_num
-                                        # Normal Header (Mon-Mon)
-                                        w_start = start_date_ref + timedelta(days=(raw_week_num - 1) * 7)
-                                        w_end = w_start + timedelta(days=7) 
-                                        range_str = f"{w_start.strftime('%d %b')} - {w_end.strftime('%d %b')}"
-                                        col_name = f"Week {raw_week_num} ({range_str})"
+                                    eff_week_num = week_num
+                                    eff_week_label = f"Week {week_num}"
                                     
-                                    # Store Link
-                                    week_headers[eff_week_num] = col_name
-
+                                    if week_num in [1, 2]:
+                                        eff_week_num = 1.5 # Special float key for W1+W2
+                                        eff_week_label = "Week 1 & 2"
+                                    
+                                    week_headers[eff_week_num] = eff_week_label
+                                    
                                     if subtype == 'Coursera':
                                         week_counts_c[eff_week_num] = week_counts_c.get(eff_week_num, 0) + 1
                                     elif subtype == 'LinkedIn':
@@ -928,7 +955,20 @@ if uploaded_file and recipient_email:
                         base_cols = [c for c in date_stats_df.columns if c not in week_cols]
                         date_stats_df = date_stats_df[base_cols + sorted_week_cols]
                         
-                        summary_df = pd.merge(summary_df, date_stats_df, on='Student Name', how='left')
+                        # Determine Merge Key for Final Join
+                        join_on = group_cols
+                        
+                        # Ensure 'Student Name' is NOT in join_on if we grouped by Roll (because summary_df has Name, but it was agg'd)
+                        # Wait, summary_df keys ARE group_cols. 
+                        # If group_cols=[Roll], summary_df has Roll as index (or col if reset_index).
+                        # Correct.
+                        
+                        summary_df = pd.merge(summary_df, date_stats_df, on=join_on, how='left')
+                        
+                        # Drop duplicate Student Name columns if they appear (e.g. Student Name_x, Student Name_y)
+                        if 'Student Name_y' in summary_df.columns:
+                            summary_df.drop(columns=['Student Name_y'], inplace=True)
+                            summary_df.rename(columns={'Student Name_x': 'Student Name'}, inplace=True)
 
                     except Exception as e:
                         st.warning(f"Could not generate summary sheet: {e}")
@@ -949,6 +989,34 @@ if uploaded_file and recipient_email:
                         
                         # 2. Student Summary
                         if not summary_df.empty:
+                             # --- Reorder Columns for Report ---
+                            try:
+                                cols = list(summary_df.columns)
+                                ordered = []
+                                
+                                # 1. Roll Number (find dynamically if var not available)
+                                r_c = locals().get('roll_col') or next((c for c in cols if 'roll' in c.lower() or 'number' in c.lower()), None)
+                                if r_c and r_c in cols:
+                                    ordered.append(r_c)
+                                    cols.remove(r_c)
+                                
+                                # 2. Student Name
+                                if 'Student Name' in cols:
+                                    ordered.append('Student Name')
+                                    cols.remove('Student Name')
+                                    
+                                # 3. Email
+                                e_c = locals().get('email_col') or next((c for c in cols if 'email' in c.lower()), None)
+                                if e_c and e_c in cols:
+                                    ordered.append(e_c)
+                                    cols.remove(e_c)
+                                    
+                                # 4. Rest of the columns
+                                ordered.extend(cols)
+                                summary_df = summary_df[ordered]
+                            except Exception as e:
+                                print(f"Column reorder failed: {e}") # Non-critical
+                            
                             with pd.ExcelWriter(summary_filename, engine='xlsxwriter') as writer:
                                 summary_df.to_excel(writer, index=False, sheet_name='Student Summary')
                                 # Auto-adjust columns for Summary
