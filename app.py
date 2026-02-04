@@ -166,6 +166,8 @@ def send_email_with_attachment(sender, password, recipient, subject, body, attac
         err_msg = str(e)
         if "534" in err_msg or "5.7.9" in err_msg:
              return False, "❌ Authentication Failed (Google Security). Please visit: https://accounts.google.com/DisplayUnlockCaptcha to unblock your account, then try again."
+        elif "535" in err_msg or "5.7.8" in err_msg:
+             return False, "❌ Authentication Failed (Bad Credentials). Your App Password may be invalid or expired. Please generate a NEW App Password in your Google Account settings."
         return False, f"Authentication Error: {err_msg}"
     except Exception as e:
         return False, str(e)
@@ -282,24 +284,26 @@ with st.sidebar:
     st.markdown("---")
     
     st.markdown("##### ⚙️ SYSTEM CONFIGURATION")
-    max_workers = st.slider("Parallel Threads", min_value=1, max_value=100, value=50)
+    max_workers = st.slider("Parallel Threads", min_value=1, max_value=50, value=20, help="Higher values (20+) risk account bans. Use with caution.")
+
     
     # Status Card logic based on slider
-    if max_workers <= 10:
-        status_color = "#ef4444"
-        status_text = "Slow Performance"
-        status_desc = "Processing will be very slow."
-        status_class = "metric-risk"
-    elif max_workers <= 70:
+    if max_workers <= 5:
         status_color = "#10b981"
-        status_text = "Optimal Performance"
-        status_desc = "Maximizes speed without errors."
+        status_text = "Safe Mode"
+        status_desc = "Recommended for Gmail accounts."
         status_class = "metric-box"
+    elif max_workers <= 20:
+        status_color = "#f59e0b"
+        status_text = "Moderate Risk"
+        status_desc = "Processing faster, but risky."
+        status_class = "metric-risk"
     else:
         status_color = "#f59e0b"
-        status_text = "High Risk Mode"
-        status_desc = "May trigger rate limits."
-        status_class = "metric-risk" # Re-use or custom
+        status_text = "Risky But Works"
+        status_desc = "High chance of bans, but runs."
+        status_class = "metric-risk"
+
 
     st.markdown(f"""
     <div class="{status_class}" style="border-left-color: {status_color};">
@@ -312,22 +316,18 @@ with st.sidebar:
     <table style="width: 100%; border-collapse: collapse; color: #e0e0e0; font-size: 0.85rem;">
         <tr style="border: 1px solid #2d3246; background: #1a1d2d;">
             <th style="padding: 8px; text-align: left; border-right: 1px solid #2d3246;">Threads</th>
-            <th style="padding: 8px; text-align: left;">Result</th>
+            <th style="padding: 8px; text-align: left;">Risk Level</th>
         </tr>
         <tr style="border: 1px solid #2d3246;">
-            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">1–10</td>
-            <td style="padding: 8px;">🐢 Too slow</td>
+            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">1–5</td>
+            <td style="padding: 8px;">✅ Safe (Recommended)</td>
         </tr>
         <tr style="border: 1px solid #2d3246;">
-            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">20–40</td>
-            <td style="padding: 8px;">⚖️ Stable + fast</td>
+            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">6–20</td>
+            <td style="padding: 8px;">⚠️ Moderate Risk</td>
         </tr>
         <tr style="border: 1px solid #2d3246;">
-            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">50–70</td>
-            <td style="padding: 8px;">🚀 Optimal</td>
-        </tr>
-        <tr style="border: 1px solid #2d3246;">
-            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">80–100</td>
+            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">21–50</td>
             <td style="padding: 8px;">⚠️ Risky But Works</td>
         </tr>
     </table>
@@ -341,8 +341,9 @@ with st.sidebar:
         st.caption("Settings")
         smtp_server = st.text_input("SMTP Server", value="smtp.gmail.com")
         smtp_port = st.number_input("SMTP Port", value=587)
-        sender_email = st.text_input("Sender Email", value="evaluator2209@gmail.com").strip()
-        sender_password = st.text_input("App Password", value="ooal rnxf ehdx irhq", type="password").strip()
+        sender_email = st.text_input("Sender Email", value="").strip()
+        sender_password = st.text_input("App Password", value="", type="password", help="Go to Google Account > Security > 2-Step Verification > App Passwords to generate this.").strip()
+        st.caption("[Get App Password from Google](https://myaccount.google.com/apppasswords)")
         
         if st.button("Test Connection"):
             with st.spinner("Testing connection..."):
@@ -355,11 +356,6 @@ with st.sidebar:
                 else:
                     st.error(f"❌ Connection Failed: {t_msg}")
 
-    # Support Contact
-    st.markdown("<br>"*2, unsafe_allow_html=True)
-    st.markdown("---")
-    st.caption("📧 Support & Contact")
-    st.markdown("**evaluator2209@gmail.com**")
     
     # Hidden / Default Configs
     anti_scraping = True 
