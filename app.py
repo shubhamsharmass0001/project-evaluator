@@ -109,6 +109,67 @@ from email.mime.base import MIMEBase
 from email import encoders
 import os
 
+
+# Helper function to send email with attachment
+def send_email_with_attachment(sender, password, recipient, subject, body, attachment_paths, server, port):
+    msg = MIMEMultipart()
+    msg['From'] = sender
+    msg['To'] = recipient
+    msg['Subject'] = subject
+
+    # Using 'html' because the body content has HTML tags
+    msg.attach(MIMEText(body, 'html'))
+
+    # Helper to attach a single file
+    def attach_file(path):
+        if not path: return None
+        try:
+             with open(path, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+             encoders.encode_base64(part)
+             part.add_header(
+                "Content-Disposition",
+                f"attachment; filename= {os.path.basename(path)}",
+             )
+             return part, None
+        except Exception as e:
+            return None, str(e)
+
+    # Handle list of paths
+    if isinstance(attachment_paths, list):
+        for path in attachment_paths:
+            part, error = attach_file(path)
+            if part:
+                msg.attach(part)
+            elif error:
+                return False, f"Could not attach file {path}: {error}"
+    else:
+        # Fallback for single path
+        part, error = attach_file(attachment_paths)
+        if part:
+             msg.attach(part)
+        elif error:
+             return False, f"Could not attach file {attachment_paths}: {error}"
+    
+    # Sanitize password (remove spaces)
+    if password:
+        password = password.replace(" ", "")
+
+    try:
+        with smtplib.SMTP(server, port) as s:
+            s.starttls()
+            s.login(sender, password)
+            s.send_message(msg)
+        return True, "Email sent successfully!"
+    except smtplib.SMTPAuthenticationError as e:
+        err_msg = str(e)
+        if "534" in err_msg or "5.7.9" in err_msg:
+             return False, "❌ Authentication Failed (Google Security). Please visit: https://accounts.google.com/DisplayUnlockCaptcha to unblock your account, then try again."
+        return False, f"Authentication Error: {err_msg}"
+    except Exception as e:
+        return False, str(e)
+
 # Page Config
 st.set_page_config(
     page_title="Project Evaluator",
@@ -117,128 +178,275 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for "Premium" look
+# Custom CSS for "ValidatorPro" UI
 st.markdown("""
 <style>
-    .metric-card {
-        background-color: #1E1E1E;
-        padding: 20px;
-        border-radius: 10px;
-        border: 1px solid #333;
-        text-align: center;
+    /* Import Google Font 'Inter' */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+        color: #e0e0e0;
+        background-color: #0b0c15; /* Deep Navy Background */
     }
-    .stProgress > div > div > div > div {
-        background-color: #00FF00;
+    
+    /* Main App Background */
+    .stApp {
+        background-color: #0b0c15;
     }
-    .success-email {
-        padding: 20px;
-        border-radius: 10px;
-        background-color: #dbf2d9;
-        color: #2e7d32;
-        border: 1px solid #c8e6c9;
+
+    /* Sidebar Styling */
+    section[data-testid="stSidebar"] {
+        background-color: #10111a;
+        border-right: 1px solid #1f212e;
+    }
+    
+    /* Headings */
+    h1, h2, h3 {
+        color: #ffffff !important;
+        font-weight: 700 !important;
+        letter-spacing: -0.5px;
+    }
+    
+    h1 { font-size: 2.5rem; }
+    h2 { font-size: 1.5rem; color: #a1a3b5 !important; font-weight: 500 !important; }
+
+    /* Custom Input Card */
+    .input-card {
+        background-color: #151725;
+        border-radius: 16px;
+        padding: 40px;
+        border: 1px solid #23263a;
         margin-top: 20px;
+        box-shadow: 0 4px 20px rgba(0,0,0,0.3);
     }
+    
+    /* File Uploader Customization */
+    [data-testid="stFileUploader"] {
+        background-color: #1a1d2d;
+        border: 1px dashed #3a3f55;
+        border-radius: 12px;
+        padding: 20px;
+    }
+    
+    /* Text Inputs */
+    .stTextInput input, .stSelectbox div[data-baseweb="select"] {
+        background-color: #1a1d2d !important;
+        color: white !important;
+        border: 1px solid #2d3246 !important;
+        border-radius: 8px !important;
+    }
+    
+    /* Primary Button (Deploy Validator) */
+    div.stButton > button:first-child {
+        background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 0.8rem 2rem;
+        font-size: 1rem;
+        font-weight: 600;
+        width: 100%;
+        transition: all 0.2s;
+    }
+    
+    div.stButton > button:first-child:hover {
+        opacity: 0.9;
+        transform: translateY(-1px);
+        border: none;
+    }
+    
+    /* Metric Cards (Sidebar) */
+    .metric-box {
+        background-color: #1a1d2d;
+        border-radius: 8px;
+        padding: 15px;
+        border-left: 4px solid #10b981; /* Green accent */
+        color: #e0e0e0;
+    }
+    .metric-risk {
+        border-left: 4px solid #f59e0b;
+    }
+    
+    /* Divider */
+    hr {
+        border-color: #2d3246;
+    }
+
 </style>
 """, unsafe_allow_html=True)
 
-# Application Title
-st.title("🎓 Automated Project Evaluator")
-st.markdown("Upload your student submissions to validate Coursera certificates and LinkedIn posts instantly.")
-
-# --- Sidebar Configuration ---
+# --- Sidebar Layout ---
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    max_workers = st.slider("Parallel Threads", min_value=1, max_value=100, value=50, help="Higher = Faster, but risk of rate limits.")
+    st.markdown("### ⚡ **ValidatorPro**")
+    st.markdown("---")
     
-    # Thread Guidelines
-    st.markdown("""
-    | Threads | Result |
-    | :--- | :--- |
-    | **1–10** | 🐢 Too slow |
-    | **20–40** | ⚖️ Stable + fast |
-    | **50–70** | 🚀 Optimal |
-    | **80–100** | ⚠️ Risky But Works |
-    """)
+    st.markdown("##### ⚙️ SYSTEM CONFIGURATION")
+    max_workers = st.slider("Parallel Threads", min_value=1, max_value=100, value=50)
+    
+    # Status Card logic based on slider
+    if max_workers <= 10:
+        status_color = "#ef4444"
+        status_text = "Slow Performance"
+        status_desc = "Processing will be very slow."
+        status_class = "metric-risk"
+    elif max_workers <= 70:
+        status_color = "#10b981"
+        status_text = "Optimal Performance"
+        status_desc = "Maximizes speed without errors."
+        status_class = "metric-box"
+    else:
+        status_color = "#f59e0b"
+        status_text = "High Risk Mode"
+        status_desc = "May trigger rate limits."
+        status_class = "metric-risk" # Re-use or custom
 
-    # anti_scraping = st.checkbox("Anti-Scraping Mode", value=True, help="Adds delays to avoid LinkedIn 429 errors.")
-    # st.info("ℹ️ **Anti-Scraping Mode** is recommended for LinkedIn validation.")
-    anti_scraping = True # Always active by default per user request
+    st.markdown(f"""
+    <div class="{status_class}" style="border-left-color: {status_color};">
+        <div style="font-weight: 600; color: {status_color};">⚡ {status_text}</div>
+        <div style="font-size: 0.85rem; color: #a1a3b5;">{status_desc}</div>
+    </div>
+    <br>
+    
+    <!-- Thread Performance Table -->
+    <table style="width: 100%; border-collapse: collapse; color: #e0e0e0; font-size: 0.85rem;">
+        <tr style="border: 1px solid #2d3246; background: #1a1d2d;">
+            <th style="padding: 8px; text-align: left; border-right: 1px solid #2d3246;">Threads</th>
+            <th style="padding: 8px; text-align: left;">Result</th>
+        </tr>
+        <tr style="border: 1px solid #2d3246;">
+            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">1–10</td>
+            <td style="padding: 8px;">🐢 Too slow</td>
+        </tr>
+        <tr style="border: 1px solid #2d3246;">
+            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">20–40</td>
+            <td style="padding: 8px;">⚖️ Stable + fast</td>
+        </tr>
+        <tr style="border: 1px solid #2d3246;">
+            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">50–70</td>
+            <td style="padding: 8px;">🚀 Optimal</td>
+        </tr>
+        <tr style="border: 1px solid #2d3246;">
+            <td style="padding: 8px; font-weight: 600; border-right: 1px solid #2d3246;">80–100</td>
+            <td style="padding: 8px;">⚠️ Risky But Works</td>
+        </tr>
+    </table>
+    """, unsafe_allow_html=True)
     
     st.markdown("---")
-    with st.expander("📧 Email Settings"):
+    
+    # Email Settings in Expanders
+    # Collapsed by default to keep clean
+    with st.expander("📩 EMAIL NOTIFICATIONS", expanded=True):
+        st.caption("Settings")
         smtp_server = st.text_input("SMTP Server", value="smtp.gmail.com")
         smtp_port = st.number_input("SMTP Port", value=587)
         sender_email = st.text_input("Sender Email", value="evaluator2209@gmail.com").strip()
-        sender_password = st.text_input("App Password", value="ymub obhg fqew lskc", type="password", help="Use an App Password for Gmail, not your login password.").strip()
-
-# --- Helper Function: Send Email ---
-def send_email_with_attachment(sender, password, recipient, subject, body, attachment_paths, server, port):
-    try:
-        msg = MIMEMultipart()
-        msg['From'] = sender
-        msg['To'] = recipient
-        msg['Subject'] = subject
+        sender_password = st.text_input("App Password", value="ooal rnxf ehdx irhq", type="password").strip()
         
-        msg.attach(MIMEText(body, 'html'))
-        
-        # Handle single path string for backward compatibility
-        if isinstance(attachment_paths, str):
-            attachment_paths = [attachment_paths]
-            
-        for path in attachment_paths:
-            if os.path.exists(path):
-                with open(path, "rb") as attachment:
-                    part = MIMEBase("application", "octet-stream")
-                    part.set_payload(attachment.read())
-                
-                encoders.encode_base64(part)
-                part.add_header(
-                    "Content-Disposition",
-                    f"attachment; filename= {os.path.basename(path)}",
+        if st.button("Test Connection"):
+            with st.spinner("Testing connection..."):
+                t_success, t_msg = send_email_with_attachment(
+                    sender_email, sender_password, sender_email, 
+                    "Test Email", "<p>This is a test email from Project Evaluator.</p>", [], smtp_server, smtp_port
                 )
-                msg.attach(part)
-        
-        with smtplib.SMTP(server, port) as s:
-            s.starttls()
-            s.login(sender, password)
-            s.send_message(msg)
-        return True, "Email sent successfully!"
-    except Exception as e:
-        return False, str(e)
+                if t_success:
+                    st.success("✅ Connection Successful!")
+                else:
+                    st.error(f"❌ Connection Failed: {t_msg}")
 
-# --- File Uploader ---
-with st.expander("ℹ️ View Sample Input Format"):
-    st.markdown("Your input file should look something like this:")
-    sample_data = pd.DataFrame({
-        'Student Name': ['John Doe', 'Jane Smith'],
-        'Coursera Link': ['https://coursera.org/verify/XYZ123', 'https://coursera.org/verify/ABC456'],
-        'LinkedIn Link': ['https://linkedin.com/posts/johndoe_certificate', 'https://linkedin.com/in/janesmith']
-    })
-    st.table(sample_data)
+    # User Profile at Bottom (simulated)
+    st.markdown("<br>"*5, unsafe_allow_html=True) # Spacer
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 10px; padding: 10px; background: #151725; border-radius: 8px;">
+        <div style="width: 35px; height: 35px; background: #6366f1; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; color: white;">SS</div>
+        <div>
+            <div style="font-size: 0.9rem; font-weight: 600;">Shubham Sharma</div>
+            <div style="font-size: 0.7rem; color: #888;">Admin Workspace</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
     
-    # Download Sample Button
-    sample_csv = sample_data.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        "📥 Download Sample CSV",
-        sample_csv,
-        "sample_input.csv",
-        "text/csv",
-        key='download-sample'
-    )
+    # Hidden / Default Configs
+    anti_scraping = True 
 
-uploaded_file = st.file_uploader("Upload Input File (Excel/CSV)", type=['xlsx', 'xls', 'csv'])
+# --- Main Layout ---
+col_main = st.container()
 
-# Email History UI
-history = load_email_history()
-selected_hist = st.selectbox("🕒 Recent Emails", ["(Select to auto-fill)"] + history)
+with col_main:
+    st.markdown("# Certificate Validation")
+    st.markdown("Automate the validation of Coursera certificates and LinkedIn submissions. Upload your dataset below to begin the verification queue.")
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # Input Card Wrapper Start
+    st.markdown('<div class="input-card">', unsafe_allow_html=True)
+    
+    st.markdown("### Input Data")
+    
+    # File Uploader & Sample
+    st.markdown('<span style="color:#a1a3b5">Supported formats: .xlsx, .csv</span>', unsafe_allow_html=True)
+    
+    # 1. Sample Data (Full Width Expander)
+    with st.expander("ℹ️ View Sample Input Format"):
+        st.markdown("Your input file should look something like this:")
+        sample_data = pd.DataFrame({
+            'Student Name': ['John Doe', 'Jane Smith'],
+            'Coursera Link': ['https://coursera.org/verify/XYZ123', 'https://coursera.org/verify/ABC456'],
+            'LinkedIn Link': ['https://linkedin.com/posts/johndoe_certificate', 'https://linkedin.com/in/janesmith']
+        })
+        st.table(sample_data)
+        
+        # Download Sample Button
+        sample_csv = sample_data.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "📥 Download Sample CSV",
+            sample_csv,
+            "sample_input.csv",
+            "text/csv",
+            key='download-sample'
+        )
 
-default_val = ""
-if selected_hist != "(Select to auto-fill)":
-    default_val = selected_hist
+    # 2. Main File Uploader
+    uploaded_file = st.file_uploader("Upload Input File (Excel/CSV)", type=['xlsx', 'xls', 'csv'], label_visibility="collapsed")
+    
+    if not uploaded_file:
+        st.markdown('<div style="text-align: center; color: #666; font-size: 0.9rem; margin-top: -10px;">👆 Drag and drop your file here</div>', unsafe_allow_html=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    
+    # 3. Email & History (Side by Side)
+    c_hist, c_recip = st.columns([1, 1])
+    
+    with c_hist:
+        # Email History UI
+        history = load_email_history()
+        selected_hist = st.selectbox("Recent Inputs", ["(Select to auto-fill)"] + history)
+    
+    default_val = ""
+    if selected_hist != "(Select to auto-fill)":
+        default_val = selected_hist
+    
+    with c_recip:
+        recipient_email = st.text_input("Recipient Email", value=default_val, placeholder="e.g., recipient@example.com")
 
-recipient_email = st.text_input("📩 Enter Recipient Email for Results", value=default_val, placeholder="e.g., recipient@example.com")
+st.markdown("</div>", unsafe_allow_html=True) # Close .input-card
+
+# --- Action Bar (Deploy Check) ---
+st.markdown("<br>", unsafe_allow_html=True)
+
+# Logic for "Deploy" / "Start" buttons
+# We need to hook this into the existing 'if uploaded_file...' logic below
+if uploaded_file and recipient_email:
+    # Calculate hash etc (preserve existing logic flow)
+    # But UI button goes here
+    pass  # We will handle button render inside the main block below to avoid scope issues
+
+# Spacer
+st.markdown("<br>", unsafe_allow_html=True)
 
 if uploaded_file and recipient_email:
+
     # Reset session state if file changes
     # Use getvalue() to compute hash, then reset pointer for pandas
     file_bytes = uploaded_file.getvalue()
@@ -375,16 +583,27 @@ if uploaded_file and recipient_email:
             if 'processing_active' not in st.session_state:
                 st.session_state['processing_active'] = False
                 
-            # Toggle Button Logic
+            # --- System Status & Deploy Action ---
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            # Status Indicator
             if st.session_state.get('processing_active'):
-                if st.button("⏸ Pause Evaluation", type="secondary"):
+                 status_html = '<div style="color: #f59e0b; font-weight: 600; margin-bottom: 8px;">🟠 System Processing...</div>'
+            else:
+                 status_html = '<div style="color: #10b981; font-weight: 600; margin-bottom: 8px;">🟢 System Ready</div>'
+            
+            st.markdown(status_html, unsafe_allow_html=True)
+
+            # Action Button
+            if st.session_state.get('processing_active'):
+                if st.button("⏸ Pause Validator", type="secondary", use_container_width=True):
                     st.session_state['processing_active'] = False
                     st.rerun()
             else:
                 has_data = len(st.session_state.get('results_map', {})) > 0
-                btn_label = "🚀 Resume Evaluation" if has_data else "🚀 Start Evaluation"
+                btn_label = "⚡ Resume Validator" if has_data else "⚡ Deploy Validator"
                 
-                if st.button(btn_label, type="primary"):
+                if st.button(btn_label, type="primary", use_container_width=True):
                     st.session_state['processing_active'] = True
                     if not has_data:
                         st.session_state['results_map'] = {} # Reset only if fresh
