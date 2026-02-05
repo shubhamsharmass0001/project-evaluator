@@ -760,13 +760,16 @@ if uploaded_file and recipient_email:
                         for key_val, group in result_df.groupby(group_cols):
                             
                             # Determine Primary Name for display
+                            # FIX: Robustly extract from the dataframe slice itself to avoid tuple/scalar ambiguity from groupby key
                             if roll_col and roll_col in group_cols:
-                                # grouped by roll -> get name
+                                # grouped by roll -> get name (first row)
                                 name = group['Student Name'].iloc[0]
-                                # key_val is the roll number
+                                # key_val might be a tuple, so we get the actual value from the column
+                                key_val_actual = group[roll_col].iloc[0]
                             else:
-                                # grouped by name -> key_val is name
-                                name = key_val
+                                # grouped by name -> get name
+                                name = group['Student Name'].iloc[0]
+                                key_val_actual = name
                             
                             # --- Unified Date Extraction Logic ---
                             # Iterate through each row to verify validity and extract the best available date.
@@ -821,7 +824,7 @@ if uploaded_file and recipient_email:
                             
                             # Add the Group Key to student_stat so we can merge back
                             if roll_col and roll_col in group_cols:
-                                student_stat[roll_col] = key_val
+                                student_stat[roll_col] = key_val_actual
                             
                             # Filter only dates within first 12 weeks AND Calculate Scores
                             filtered_dts_only = []
