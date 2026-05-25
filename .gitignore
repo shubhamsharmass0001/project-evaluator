@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Excel Outputs & Inputs
+final_results.xlsx
+student_summary.xlsx
+cleaned_input.xlsx
+*_input.xlsx
+*_input.csv
+
+# Application State/Cache
+progress_cache.pkl
+progress_meta.json
+email_history.json
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+
+# Virtual Env
+venv/
+env/
+.env
